@@ -177,52 +177,60 @@ def gunzip(d):
         return d
 
 # ─── 抖音弹幕处理 ───
-def process_douyin_frame(raw, log_fn):
-    frame = proto_fields(raw)
-    pt = pI(frame, 1)
-    pay = pB(frame, 3)
-    if pt == 0xa and pay:
-        pay = gunzip(pay)
-    elif pay:
-        pass
-    mb = proto_fields(pay) if pay else {}
-    handle_douyin_msg(mb, log_fn)
+def process_douyin_frame(raw: bytes, log_fn) -> None:
+    """解析一帧抖音 PushFrame，逐条分派其中打包的消息。
 
-def handle_douyin_msg(data, log_fn):
-    f = data
-    method = pS(f, 2)
+    参数:
+        raw: WebSocket 二进制帧
+        log_fn: 界面日志函数
+    说明:
+        PushFrame: 7=payloadType（'msg' 为消息，'hb' 为心跳），8=payload（gzip）。
+        payload 解压后为 Response: 1=repeated Message；Message: 1=method，2=消息体。
+    """
+    frame = proto_fields(raw)
+    if pS(frame, 7) != 'msg':
+        return
+    pay = pB(frame, 8)
+    if not pay:
+        return
+    for msg_bytes in pL(proto_fields(gunzip(pay)), 1):
+        if not isinstance(msg_bytes, bytes):
+            continue
+        msg = proto_fields(msg_bytes)
+        try:
+            handle_douyin_msg(pS(msg, 1), proto_fields(pB(msg, 2)), log_fn)
+        except Exception as e:
+            logger.debug('[抖音] 解析消息失败: %r', e)
+
+def _douyin_nick(msg_fields: dict, user_field: int) -> str:
+    """从消息体中取出 User 子消息的昵称（User.field 3）。"""
+    return pS(proto_fields(pB(msg_fields, user_field)), 3) or '?'
+
+def handle_douyin_msg(method: str, mf: dict, log_fn) -> None:
+    """按消息类型解析抖音消息体并显示。
+
+    参数:
+        method: 消息类型，如 'WebcastChatMessage'
+        mf: 已解析的消息体字段
+        log_fn: 界面日志函数
+    """
     if method == 'WebcastChatMessage':
-        pay = pB(f, 5)
-        if pay:
-            mf = proto_fields(pay)
-            uf = proto_fields(pB(mf, 2))
-            nick = pS(uf, 1) or '?'
-            text = pS(mf, 1)
-            log_fn(f'[抖音] {nick}: {text}', tag='chat')
+        # 2=user，3=content
+        log_fn(f'[抖音] {_douyin_nick(mf, 2)}: {pS(mf, 3)}', tag='chat')
     elif method == 'WebcastGiftMessage':
-        pay = pB(f, 5)
-        if pay:
-            mf = proto_fields(pay)
-            uf = proto_fields(pB(mf, 7))
-            nick = pS(uf, 1) or '?'
-            gf = proto_fields(pB(mf, 1))
-            gift = pS(gf, 1) or 'gift'
-            cnt = pI(mf, 3) or 1
-            log_fn(f'[抖音] [礼物] {nick} 送出 {gift} x{cnt}', tag='gift')
+        # 7=user，15=gift（GiftStruct，16=name），5=repeatCount，6=comboCount
+        gift = pS(proto_fields(pB(mf, 15)), 16) or 'gift'
+        cnt = pI(mf, 5) or pI(mf, 6) or 1
+        log_fn(f'[抖音] [礼物] {_douyin_nick(mf, 7)} 送出 {gift} x{cnt}', tag='gift')
     elif method == 'WebcastLikeMessage':
-        pay = pB(f, 5)
-        if pay:
-            mf = proto_fields(pay)
-            uf = proto_fields(pB(mf, 5))
-            nick = pS(uf, 1) or '?'
-            log_fn(f'[抖音] [点赞] {nick}', tag='like')
+        # 5=user，2=本次点赞数
+        log_fn(f'[抖音] [点赞] {_douyin_nick(mf, 5)} x{pI(mf, 2) or 1}', tag='like')
     elif method == 'WebcastMemberMessage':
-        pay = pB(f, 5)
-        if pay:
-            mf = proto_fields(pay)
-            uf = proto_fields(pB(mf, 3))
-            nick = pS(uf, 1) or '?'
-            log_fn(f'[抖音] [进入] {nick} 进入直播间', tag='join')
+        # 2=user
+        log_fn(f'[抖音] [进入] {_douyin_nick(mf, 2)} 进入直播间', tag='join')
+    elif method == 'WebcastSocialMessage' and pI(mf, 4) == 1:
+        # 2=user，4=action（1=关注）
+        log_fn(f'[抖音] [关注] {_douyin_nick(mf, 2)} 关注了主播', tag='join')
 
 async def run_douyin(room_id, log_fn, stop_event):
     from playwright.async_api import async_playwright
@@ -242,19 +250,29 @@ async def run_douyin(room_id, log_fn, stop_event):
 
         async def on_ws(ws):
             url = ws.url
+            log_fn(f'[抖音] [调试] 检测到 WebSocket: {url}')
             if 'webcast' not in url:
+                log_fn('[抖音] [调试] URL 不含 webcast，跳过')
                 return
             log_fn('[抖音] ✓ 已连接 — 正在接收弹幕')
+            frame_count = 0
             async def on_frame(payload):
+                nonlocal frame_count
+                frame_count += 1
                 raw = payload if isinstance(payload, bytes) else payload.encode('utf-8') if isinstance(payload, str) else b''
+                if frame_count <= 5:
+                    log_fn(f'[抖音] [调试] 收到第 {frame_count} 帧，类型={type(payload).__name__} 长度={len(raw)}')
                 if raw:
                     process_douyin_frame(raw, log_fn)
             ws.on('framereceived', on_frame)
             ws.on('close', lambda: log_fn('[抖音] WebSocket 已断开'))
 
         page.on('websocket', on_ws)
+        page.on('worker', lambda w: log_fn(f'[抖音] [调试] 页面启动 Worker: {w.url}'))
         await page.goto(f'https://live.douyin.com/{room_id}', wait_until='domcontentloaded')
         await page.wait_for_timeout(3000)
+        log_fn(f'[抖音] [调试] 当前页面 URL: {page.url}')
+        log_fn(f'[抖音] [调试] 页面标题: {await page.title()}')
         log_fn('[抖音] 页面已加载 ✓')
         await wait_until_stopped(page, stop_event, '[抖音]', log_fn)
         try:
