@@ -162,11 +162,3 @@ page.on('response', on_response)   # 仅视频号使用：监听 HTTP 响应
 ## 许可
 
 本项目基于 HeyNau Games 的 BLR 1.02 修改，仅供学习交流使用。
-
-## 关于本项目
-
-前 4 项修改（新增快手平台、新增视频号平台、界面中文化、显示浏览器窗口）以及 PyInstaller 打包配置，由 **WorkBuddy AI** 协助完成。如需了解 WorkBuddy，请访问 [codebuddy.cn](https://www.codebuddy.cn)。
-
-## 联系方式
-
-- 邮箱：wwwqsid@outlook.com
