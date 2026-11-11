@@ -1,7 +1,5 @@
 English | [简体中文](README.md)
 
-> ⚠️ **This document is written by WorkBuddy AI.**
-
 # Burgie China Danmu Assistant
 
 > This project is derived from the original author **HeyNau Games**' [BLR (Burgie's Livestream Reader) 1.02](https://steamcommunity.com/app/3314340/discussions/0/561408449130437193/) plugin.
@@ -25,9 +23,11 @@ The original plugin already supported three platforms: Douyin, Bilibili, and Xia
 | Kuaishou | ✨ New | WebSocket interception + Protobuf parsing | No |
 | WeChat Channels (视频号) | ✨ New | HTTP response interception + WebSocket | Yes (WeChat QR scan, streamer account) |
 
-## 🎮 How It Works
+## Features
 
-The tool reads live chat messages from Chinese streaming platforms and forwards them to the game **Burgie's Cozy Kitchen** via a local IRC server. Viewers can order burgers, ring bells, change skins, and file complaints — all through chat commands.
+Reads chat messages, gifts, likes, joins and other events from Chinese live streaming platforms and displays them directly in the program window.
+
+> This version removes the original plugin's feature of forwarding chat to the game Burgie's Cozy Kitchen through a local IRC server. Chat is only displayed in this program's window.
 
 ## 🚀 Getting Started
 
@@ -57,39 +57,24 @@ pyinstaller "Burgie弹幕助手.spec" --noconfirm
 
 The built executable will be in `dist/Burgie弹幕助手/`.
 
-## 📋 Chat Commands
-
-| Command | Description |
-|---------|-------------|
-| `!Burgie [ingredients]` | Order a burger |
-| `!Bell` | Ring the bell |
-| `!Skin {gender} {animal}` | Change skin (Subscribers/VIP only) |
-| `!Leave` | Leave the counter |
-| `!Dirty` | Complain: food touched the floor |
-| `!Fire` | Complain: pan is on fire |
-| `!Noise` | Complain: too much bell ringing |
-
-Full command list: [Official Site](https://heynaugames.com/burgie-commands)
-
 ## 🔧 Tech Stack
 
 - **Python** + **Tkinter** — GUI
 - **Playwright** — Browser automation / WebSocket interception
 - **Protobuf** — Manual parsing (no third-party protobuf library)
-- **IRC Server** — Local TCP relay to forward danmaku to the game
 
 ## Architecture
 
 ### Overview
 
-This program is a **danmaku bridge**: it reads chat messages, gifts, likes and join events from live streaming platforms, converts them into **IRC protocol messages**, and pushes them to Burgie's Cozy Kitchen (typing `BLRMod` in-game makes the game connect to this program as an IRC server).
+This program is a **live chat reader**: it reads chat messages, gifts, likes, joins and other events from live streaming platforms, parses them and displays them directly in the program window.
 
 ```
 Platform web page --(WebSocket/HTTP)--> Playwright browser --intercepted frames--> Platform parser
                                                                                         |
-                                                              Unified events CHAT/GIFT/LIKE/JOIN...
+                                                                 Chat/gift/like/join events
                                                                                         v
-Burgie's Cozy Kitchen <--(TCP localhost:6667, PRIVMSG #live)-- IRCServer
+                                                              Tkinter window log (colored by type)
 ```
 
 All logic lives in `BLR_ks.py`:
@@ -97,7 +82,6 @@ All logic lives in `BLR_ks.py`:
 | Component | Thread | Responsibility |
 |-----------|--------|----------------|
 | `App` (Tkinter GUI) | Main thread | Platform selection, room ID input, connect/disconnect, log display |
-| `IRCServer` | Accept thread + one thread per client | Emulates an IRC server on local port 6667 and broadcasts events to the game |
 | `run_douyin` / `run_bilibili` / `run_xhs` / `run_kuaishou` / `run_wechat_channels` | asyncio event loop in a dedicated thread | Launch the browser and intercept network data |
 | `proto_fields` and helpers | - | Hand-written schema-less Protobuf decoder |
 | Logging | - | Written to `blr_debug.log` (2 MB rotation); messages containing `[调试]` (debug) go to the file only, not the GUI |
@@ -105,11 +89,10 @@ All logic lives in `BLR_ks.py`:
 ### Startup and Connection Flow
 
 1. **Locate a browser** (`find_chromium_exe`): prefers the bundled `chromium_data/chromium-*/chrome-win64/chrome.exe`, falling back to an installed Chrome / Edge.
-2. **Start the IRC server**: listens on `0.0.0.0:6667` as soon as the program opens.
-3. **Click "Connect"** (`App.start`):
+2. **Click "Connect"** (`App.start`):
    - Parse the room ID: Kuaishou accepts alphanumeric IDs or `live.kuaishou.com/u/xxx` links; WeChat Channels needs no room ID; other platforms extract a number of 5+ digits from the input.
    - A new `asyncio.Event` is created as the stop signal for every connection, then the platform coroutine runs in a new thread.
-4. **Click "Disconnect"**: the stop signal is set across threads via `loop.call_soon_threadsafe(stop_ev.set)`; the coroutine closes the browser and the GUI returns to the disconnected state.
+3. **Click "Disconnect"**: the stop signal is set across threads via `loop.call_soon_threadsafe(stop_ev.set)`; the coroutine closes the browser and the GUI returns to the disconnected state.
 
 ### Core Mechanism: Real-Browser Interception
 
@@ -133,19 +116,20 @@ Signatures, encrypted parameters, heartbeats and authentication are all handled 
 | Kuaishou | `live.kuaishou.com/u/{id}` | URL contains `kuaishou` or `live-ws` | SocketMessage Protobuf (field 1=payloadType, 2=compression, 3=payload). `310` is the feed push: field 5 comments, 9 gifts, 8 likes, 12 shares; `340` is the online viewer list: the first list is the baseline and newly appearing users are treated as joins; `300` is the enter-room ack |
 | WeChat Channels | `channels.weixin.qq.com/platform/live/liveBuild` | URL contains `weixin` / `channels` / `finder`; HTTP JSON responses from these domains are also monitored | The streamer must scan a QR code to log in to the dashboard (waits up to 5 minutes). Heuristic parsing: tries both JSON and Protobuf, looks in lists such as `comments` / `msgs` / `list`, and extracts by candidate field names like `nickname` / `content` / `giftName` |
 
-### Output: IRC Protocol
+### Output: Window Display
 
-After the game connects and sends `NICK` / `USER`, the server replies with `001` and `376` and joins the `#live` channel. Events from all platforms are broadcast in one unified format:
+Parsed events are shown in the window log area via `App.log(msg, tag)`, colored by type:
 
-```
-:{nick}!live@BLRMod PRIVMSG #live :{type}|{user}|{content}|{extra}
-```
+| Type | Color | Example |
+|------|-------|---------|
+| Chat / WeChat Channels chat | White | `[B站] nickname: content` |
+| Gift / Bilibili guard purchase | Gold | `[抖音] [礼物] nickname 送出 gift xcount` |
+| Like | Pink | `[快手] [点赞] nickname` |
+| Join / follow / share | Green | `[小红书] [进入] nickname 进入直播间` |
+| Bilibili Super Chat | Orange | `[B站] [SC 30元] nickname: content` |
+| System messages | Gray | Connection status, errors |
 
-- `type`: `CHAT` / `GIFT` / `LIKE` / `JOIN` / `SC` / `SHARE` / `follow` / `guard`
-- `extra`: additional info such as gift count
-- Spaces in nicknames are replaced with `_`; line breaks are removed
-
-This program **does not parse game commands**; commands such as `!Burgie` and `!Bell` are recognized by the game itself from `CHAT` messages.
+Log lines in the window are in Chinese. Debug messages (containing `[调试]`) are written only to `blr_debug.log`, not the window.
 
 ### Known Limitations
 

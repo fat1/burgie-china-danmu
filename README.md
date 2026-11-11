@@ -1,7 +1,5 @@
 [English](README_EN.md) | 简体中文
 
-> ⚠️ **本文件由 WorkBuddy AI 撰写。**
-
 # Burgie 直播弹幕助手
 
 > 本项目源自原作者 **HeyNau Games** 的 [BLR (Burgie's Livestream Reader) 1.02](https://steamcommunity.com/app/3314340/discussions/0/561408449130437193/) 插件。
@@ -25,9 +23,11 @@
 | 快手 Kuaishou | ✨ 新增 | WebSocket 拦截 + Protobuf 解析 | 否 |
 | 视频号 WeChat | ✨ 新增 | HTTP 响应拦截 + WebSocket | 需微信扫码（主播账号） |
 
-## 🎮 配合游戏
+## 功能说明
 
-[Burgie's Cozy Kitchen](https://heynaugames.com/burgie-commands) 直播做饭游戏，弹幕指令包括点餐、投诉、换皮肤等。
+读取直播间的弹幕、礼物、点赞、进场等事件，直接显示在程序窗口中。
+
+> 本版本已移除原插件通过本地 IRC 服务器把弹幕转发给游戏 Burgie's Cozy Kitchen 的功能，弹幕只在本程序界面中显示。
 
 ## 🚀 使用方法
 
@@ -57,39 +57,24 @@ pyinstaller "Burgie弹幕助手.spec" --noconfirm
 
 打包结果在 `dist/Burgie弹幕助手/` 目录下。
 
-## 📋 弹幕指令
-
-| 指令 | 用途 |
-|------|------|
-| `!Burgie [食材]` | 点一个汉堡 |
-| `!Bell` | 按铃铛 |
-| `!Skin {性别} {动物}` | 更换皮肤（订阅者/VIP） |
-| `!Leave` | 离开柜台 |
-| `!Dirty` | 投诉食物碰地 |
-| `!Fire` | 投诉起火 |
-| `!Noise` | 投诉按铃铛 |
-
-完整指令列表见 [官网](https://heynaugames.com/burgie-commands)。
-
 ## 🔧 技术栈
 
 - **Python** + **Tkinter**（GUI）
 - **Playwright**（浏览器自动化 / WebSocket 拦截）
 - **Protobuf** 手动解析（无第三方 protobuf 库依赖）
-- **IRC Server**（本地 TCP 转发弹幕到游戏）
 
 ## 运行原理
 
 ### 总体架构
 
-本程序是一个**弹幕桥接器**：从直播平台读取弹幕、礼物、点赞、进场事件，统一转换为 **IRC 协议消息**，推送给游戏 Burgie's Cozy Kitchen（游戏内输入 `BLRMod` 后，会把本程序当作 IRC 服务器连接）。
+本程序是一个**直播弹幕读取器**：从直播平台读取弹幕、礼物、点赞、进场等事件，解析后直接显示在程序窗口中。
 
 ```
 直播平台网页 --(WebSocket/HTTP)--> Playwright 浏览器 --拦截数据帧--> 平台解析器
                                                                       |
-                                                    统一事件 CHAT/GIFT/LIKE/JOIN...
+                                                     弹幕/礼物/点赞/进场等事件
                                                                       v
-游戏 Burgie's Cozy Kitchen <--(TCP localhost:6667, PRIVMSG #live)-- IRCServer
+                                                      Tkinter 窗口日志（按类型着色）
 ```
 
 全部逻辑位于 `BLR_ks.py`：
@@ -97,7 +82,6 @@ pyinstaller "Burgie弹幕助手.spec" --noconfirm
 | 组件 | 运行线程 | 职责 |
 |------|---------|------|
 | `App`（Tkinter GUI） | 主线程 | 选择平台、输入房间号、连接/断开、显示日志 |
-| `IRCServer` | accept 线程 + 每客户端一个线程 | 在本地 6667 端口模拟 IRC 服务器，向游戏广播事件 |
 | `run_douyin` / `run_bilibili` / `run_xhs` / `run_kuaishou` / `run_wechat_channels` | 独立线程内的 asyncio 事件循环 | 启动浏览器并拦截网络数据 |
 | `proto_fields` 等工具函数 | - | 手写的无 schema Protobuf 解码器 |
 | 日志 | - | 写入 `blr_debug.log`（2MB 轮转）；含 `[调试]` 的消息只写文件，不显示在界面 |
@@ -105,11 +89,10 @@ pyinstaller "Burgie弹幕助手.spec" --noconfirm
 ### 启动与连接流程
 
 1. **查找浏览器**（`find_chromium_exe`）：优先使用自带的 `chromium_data/chromium-*/chrome-win64/chrome.exe`，找不到时回退到系统安装的 Chrome / Edge。
-2. **启动 IRC 服务器**：程序打开即监听 `0.0.0.0:6667`。
-3. **点击"连接"**（`App.start`）：
+2. **点击"连接"**（`App.start`）：
    - 解析房间号：快手支持字母数字混合 ID 或 `live.kuaishou.com/u/xxx` 链接；视频号无需房间号；其他平台从输入中提取 5 位以上数字。
    - 每次连接新建一个 `asyncio.Event` 作为停止信号，然后在新线程中运行对应平台的协程。
-4. **点击"断开"**：通过 `loop.call_soon_threadsafe(stop_ev.set)` 跨线程发出停止信号，协程检测到后关闭浏览器，界面恢复为未连接状态。
+3. **点击"断开"**：通过 `loop.call_soon_threadsafe(stop_ev.set)` 跨线程发出停止信号，协程检测到后关闭浏览器，界面恢复为未连接状态。
 
 ### 核心机制：真实浏览器拦截
 
@@ -133,19 +116,20 @@ page.on('response', on_response)   # 仅视频号：监听 HTTP 响应
 | 快手 | `live.kuaishou.com/u/{id}` | URL 含 `kuaishou` 或 `live-ws` | SocketMessage Protobuf（field 1=payloadType，2=压缩方式，3=payload）。`310` 为聚合推送：field 5 弹幕、9 礼物、8 点赞、12 分享；`340` 为在线观众列表，首个列表作为基线，之后新出现的用户视为进场；`300` 为进房确认 |
 | 视频号 | `channels.weixin.qq.com/platform/live/liveBuild` | URL 含 `weixin` / `channels` / `finder`，同时监听这些域名的 HTTP JSON 响应 | 需主播扫码登录后台（最多等待 5 分钟）。采用启发式解析：同时尝试 JSON 和 Protobuf，在 `comments` / `msgs` / `list` 等列表中按 `nickname` / `content` / `giftName` 等候选字段名提取 |
 
-### 输出：IRC 协议
+### 输出：界面显示
 
-游戏连接后发送 `NICK` / `USER`，服务器回复 `001`、`376` 并加入 `#live` 频道。所有平台的事件都按统一格式广播：
+解析出的事件通过 `App.log(msg, tag)` 显示在窗口日志区，按类型着色：
 
-```
-:{昵称}!live@BLRMod PRIVMSG #live :{类型}|{用户}|{内容}|{附加}
-```
+| 类型 | 颜色 | 示例 |
+|------|------|------|
+| 弹幕 / 视频号弹幕 | 白色 | `[B站] 昵称: 内容` |
+| 礼物 / B站上舰 | 金色 | `[抖音] [礼物] 昵称 送出 礼物 x数量` |
+| 点赞 | 粉色 | `[快手] [点赞] 昵称` |
+| 进场 / 关注 / 分享 | 绿色 | `[小红书] [进入] 昵称 进入直播间` |
+| B站 SC | 橙色 | `[B站] [SC 30元] 昵称: 内容` |
+| 系统消息 | 灰色 | 连接状态、错误提示 |
 
-- `类型`：`CHAT` / `GIFT` / `LIKE` / `JOIN` / `SC` / `SHARE` / `follow` / `guard`
-- `附加`：礼物数量等额外信息
-- 昵称中的空格替换为 `_`，换行符会被去除
-
-本程序**不解析游戏指令**；`!Burgie`、`!Bell` 等指令由游戏收到 `CHAT` 消息后自行识别。
+调试信息（含 `[调试]`）只写入 `blr_debug.log`，不显示在界面。
 
 ### 已知限制
 
