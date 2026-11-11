@@ -110,11 +110,34 @@ Signatures, encrypted parameters, heartbeats and authentication are all handled 
 
 | Platform | Page opened | WebSocket filter | Data format and parsing |
 |----------|-------------|------------------|-------------------------|
-| Douyin | `live.douyin.com/{id}` | URL contains `webcast` | Protobuf outer frame (payload may be gzipped), dispatched by `method`: `WebcastChatMessage` / `WebcastGiftMessage` / `WebcastLikeMessage` / `WebcastMemberMessage` |
+| Douyin | `live.douyin.com/{id}` | URL contains `webcast` | PushFrame Protobuf: field 7 is the type (`msg` message / `hb` heartbeat), field 8 is a gzipped Response; Response field 1 holds multiple packed Messages (1=method, 2=body, nickname in User.field 3), dispatched by method: `WebcastChatMessage` / `WebcastGiftMessage` / `WebcastLikeMessage` / `WebcastMemberMessage` / `WebcastSocialMessage` (action=1 follow) |
 | Xiaohongshu | `xiaohongshu.com/livestream/{id}` | URL contains `xiaohongshu` | JSON -> `data.items[].b` (Base64) -> inner JSON `customData`, dispatched by `type`: `text` / `gift_comment` / `audience_join_v2` / `praise` / `follow_emcee` |
 | Bilibili | `live.bilibili.com/{id}` | URL contains `chat.bilibili.com` and `/sub` | 16-byte header (total length/header length/ver/op/seq), multiple packets per frame, only op=5 handled; ver=2 is zlib and ver=3 is brotli, decompressed and parsed recursively; dispatched by `cmd`: `DANMU_MSG` / `SEND_GIFT` / `SUPER_CHAT_MESSAGE` / `INTERACT_WORD(_V2)` / `GUARD_BUY` |
 | Kuaishou | `live.kuaishou.com/u/{id}` | URL contains `kuaishou` or `live-ws` | SocketMessage Protobuf (field 1=payloadType, 2=compression, 3=payload). `310` is the feed push: field 5 comments, 9 gifts, 8 likes, 12 shares; `340` is the online viewer list: the first list is the baseline and newly appearing users are treated as joins; `300` is the enter-room ack |
 | WeChat Channels | `channels.weixin.qq.com/platform/live/liveBuild` | URL contains `weixin` / `channels` / `finder`; HTTP JSON responses from these domains are also monitored | The streamer must scan a QR code to log in to the dashboard (waits up to 5 minutes). Heuristic parsing: tries both JSON and Protobuf, looks in lists such as `comments` / `msgs` / `list`, and extracts by candidate field names like `nickname` / `content` / `giftName` |
+
+### How WeChat Channels Capture Works
+
+WeChat Channels differs a lot from the other platforms (see `run_wechat_channels`):
+
+1. **Open the streamer dashboard and scan to log in**: WeChat Channels has no viewer-facing live room page on the web, so the program opens the streamer dashboard `channels.weixin.qq.com/platform/live/liveBuild`. No room ID is needed, but the **streamer** must log in by scanning a QR code with WeChat (the program waits up to 5 minutes). The dashboard only fetches chat after logging in, opening the live management page and going live.
+2. **Listen on two channels at once**:
+   ```python
+   page.on('websocket', on_ws)        # WebSockets whose URL contains weixin / channels / finder
+   page.on('response', on_response)   # JSON-like HTTP responses from channels / live / finder.weixin.qq.com
+   ```
+   The dashboard mainly gets new chat by periodically polling HTTP APIs, and the program reads those responses; WebSocket is a fallback.
+3. **Heuristic parsing by candidate field names**:
+   - Strip wrappers such as `{errCode, errMsg, data}`;
+   - In lists named like `comments` / `msgs` / `list`, check each item for:
+     - Nickname: `nickname` / `nickName` / `userName` etc., also inside sub-objects such as `user`;
+     - Content: `content` / `text` / `msg` etc.; any content is treated as chat;
+     - Gift: `giftName` / `giftId` etc.;
+     - Like: keys such as `like` / `praise`;
+     - Join: a nickname with no content, plus keys such as `enter` / `join`;
+   - For binary (Protobuf) data, a few common field numbers are tried blindly for nickname and content.
+
+**Limitations**: this parsing has never been checked against real data. It misses events when the real field names are not in the candidate lists, and may misreport when other dashboard APIs happen to contain fields like `name` / `content`. To confirm it works, capture real HTTP responses and WebSocket frames while the streamer is live, then rewrite the parser to match the real format.
 
 ### Output: Window Display
 

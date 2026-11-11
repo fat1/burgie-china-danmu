@@ -110,11 +110,34 @@ page.on('response', on_response)   # 仅视频号：监听 HTTP 响应
 
 | 平台 | 打开的页面 | WebSocket 筛选 | 数据格式与解析 |
 |------|-----------|---------------|---------------|
-| 抖音 | `live.douyin.com/{id}` | URL 含 `webcast` | Protobuf 外层帧（payload 可能 gzip 压缩），按 `method` 字段分派：`WebcastChatMessage` / `WebcastGiftMessage` / `WebcastLikeMessage` / `WebcastMemberMessage` |
+| 抖音 | `live.douyin.com/{id}` | URL 含 `webcast` | PushFrame Protobuf：field 7 为类型（`msg` 消息 / `hb` 心跳），field 8 为 gzip 压缩的 Response；Response field 1 是打包的多条 Message（1=method，2=消息体，用户昵称在 User.field 3），按 method 分派：`WebcastChatMessage` / `WebcastGiftMessage` / `WebcastLikeMessage` / `WebcastMemberMessage` / `WebcastSocialMessage`（action=1 关注） |
 | 小红书 | `xiaohongshu.com/livestream/{id}` | URL 含 `xiaohongshu` | JSON -> `data.items[].b`（Base64）-> 内层 JSON `customData`，按 `type` 分派：`text` / `gift_comment` / `audience_join_v2` / `praise` / `follow_emcee` |
 | B站 | `live.bilibili.com/{id}` | URL 含 `chat.bilibili.com` 且含 `/sub` | 16 字节包头（总长/头长/ver/op/seq），一帧可含多个包，只处理 op=5；ver=2 用 zlib、ver=3 用 brotli 解压后递归拆包；按 `cmd` 分派：`DANMU_MSG` / `SEND_GIFT` / `SUPER_CHAT_MESSAGE` / `INTERACT_WORD(_V2)` / `GUARD_BUY` |
 | 快手 | `live.kuaishou.com/u/{id}` | URL 含 `kuaishou` 或 `live-ws` | SocketMessage Protobuf（field 1=payloadType，2=压缩方式，3=payload）。`310` 为聚合推送：field 5 弹幕、9 礼物、8 点赞、12 分享；`340` 为在线观众列表，首个列表作为基线，之后新出现的用户视为进场；`300` 为进房确认 |
 | 视频号 | `channels.weixin.qq.com/platform/live/liveBuild` | URL 含 `weixin` / `channels` / `finder`，同时监听这些域名的 HTTP JSON 响应 | 需主播扫码登录后台（最多等待 5 分钟）。采用启发式解析：同时尝试 JSON 和 Protobuf，在 `comments` / `msgs` / `list` 等列表中按 `nickname` / `content` / `giftName` 等候选字段名提取 |
+
+### 视频号抓取说明
+
+视频号与其他平台差异较大，单独说明（对应 `run_wechat_channels`）：
+
+1. **打开主播后台并扫码登录**：视频号网页端没有观众可看的直播间页面，只能打开主播后台 `channels.weixin.qq.com/platform/live/liveBuild`。因此无需输入房间号，但必须由**主播本人**用微信扫码登录，程序最多等待 5 分钟。登录后进入直播管理页面并开播，后台页面才会拉取弹幕。
+2. **同时监听两条数据通道**：
+   ```python
+   page.on('websocket', on_ws)        # 地址包含 weixin / channels / finder 的 WebSocket
+   page.on('response', on_response)   # channels / live / finder.weixin.qq.com 的 JSON 类 HTTP 响应
+   ```
+   后台页面主要通过定时请求 HTTP 接口获取新弹幕，程序旁听这些响应；WebSocket 作为备用通道。
+3. **按候选字段名启发式解析**：
+   - 剥掉 `{errCode, errMsg, data}` 之类的外层包装；
+   - 在名字像 `comments` / `msgs` / `list` 的列表中逐条查找：
+     - 昵称：`nickname` / `nickName` / `userName` 等，也会到 `user` 等子对象里找；
+     - 内容：`content` / `text` / `msg` 等，有内容即视为弹幕；
+     - 礼物：`giftName` / `giftId` 等；
+     - 点赞：出现 `like` / `praise` 等键；
+     - 进场：有昵称、无内容，且出现 `enter` / `join` 等键；
+   - 二进制（Protobuf）数据则盲试几个常见字段编号提取昵称和内容。
+
+**局限**：这套解析从未用真实数据核对过。真实字段名不在候选列表中时会漏报；后台其他接口恰好带有 `name` / `content` 等字段时可能误报。要确认可用，需要在主播开播时抓取真实的 HTTP 响应和 WebSocket 帧，再按真实格式改写解析。
 
 ### 输出：界面显示
 
