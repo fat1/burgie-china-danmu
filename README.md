@@ -162,3 +162,7 @@ page.on('response', on_response)   # 仅视频号使用：监听 HTTP 响应
 ## 许可
 
 本项目基于 HeyNau Games 的 BLR 1.02 修改，仅供学习交流使用。
+
+## 联系方式
+
+- 邮箱：5025508@qq.com
