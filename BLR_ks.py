@@ -28,16 +28,83 @@ def find_chromium_exe():
         base = os.path.dirname(os.path.abspath(__file__))
         candidates = [os.path.join(base, 'chromium_data')]
     for cdata in candidates:
-        os.environ['PLAYWRIGHT_BROWSERS_PATH'] = cdata
         if os.path.isdir(cdata):
+            os.environ['PLAYWRIGHT_BROWSERS_PATH'] = cdata
             for d in os.listdir(cdata):
                 if d.startswith('chromium-') and not d.startswith('chromium_headless'):
                     exe = os.path.join(cdata, d, 'chrome-win64', 'chrome.exe')
                     if os.path.isfile(exe):
                         return exe
+    # 未找到自带 Chromium 时，回退到系统已安装的 Chrome / Edge
+    system_candidates = [
+        os.path.join(os.environ.get('PROGRAMFILES', r'C:\Program Files'),
+                     'Google', 'Chrome', 'Application', 'chrome.exe'),
+        os.path.join(os.environ.get('PROGRAMFILES(X86)', r'C:\Program Files (x86)'),
+                     'Google', 'Chrome', 'Application', 'chrome.exe'),
+        os.path.join(os.environ.get('LOCALAPPDATA', ''),
+                     'Google', 'Chrome', 'Application', 'chrome.exe'),
+        os.path.join(os.environ.get('PROGRAMFILES(X86)', r'C:\Program Files (x86)'),
+                     'Microsoft', 'Edge', 'Application', 'msedge.exe'),
+    ]
+    for exe in system_candidates:
+        if os.path.isfile(exe):
+            return exe
     return None
 
 CHROMIUM_EXE = find_chromium_exe()
+
+# ─── 文件日志 ───
+import logging
+import traceback
+from logging.handlers import RotatingFileHandler
+
+def _log_dir() -> str:
+    """返回日志目录：打包后为 exe 所在目录，源码运行时为脚本所在目录。"""
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+LOG_FILE = os.path.join(_log_dir(), 'blr_debug.log')
+logger = logging.getLogger('blr')
+logger.setLevel(logging.DEBUG)
+try:
+    _fh = RotatingFileHandler(LOG_FILE, maxBytes=2 * 1024 * 1024, backupCount=3, encoding='utf-8')
+    _fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] [%(threadName)s] %(message)s'))
+    logger.addHandler(_fh)
+except OSError:
+    # 目录不可写时退回到 stderr，不影响主程序运行
+    logger.addHandler(logging.StreamHandler())
+
+def _log_uncaught(exc_type, exc, tb):
+    logger.critical('未捕获异常:\n%s', ''.join(traceback.format_exception(exc_type, exc, tb)))
+sys.excepthook = _log_uncaught
+threading.excepthook = lambda a: _log_uncaught(a.exc_type, a.exc_value, a.exc_traceback)
+
+logger.info('===== 程序启动 Python %s | frozen=%s | CHROMIUM_EXE=%s =====',
+            sys.version.split()[0], getattr(sys, 'frozen', False), CHROMIUM_EXE)
+
+def attach_diagnostics(browser, page, tag: str, log_fn) -> None:
+    """为浏览器和页面挂载关闭/崩溃事件，便于定位浏览器"打开后就断开"的原因。
+
+    参数:
+        browser: Playwright Browser 对象
+        page: Playwright Page 对象
+        tag: 平台标签，如 '[快手]'
+        log_fn: 界面日志函数
+    """
+    browser.on('disconnected', lambda *_: log_fn(f'{tag} [诊断] 浏览器进程已断开（被关闭或崩溃）'))
+    page.on('close', lambda *_: log_fn(f'{tag} [诊断] 页面已关闭'))
+    page.on('crash', lambda *_: log_fn(f'{tag} [诊断] 页面崩溃'))
+    page.on('pageerror', lambda err: logger.debug('%s 页面 JS 错误: %s', tag, err))
+
+async def wait_until_stopped(page, stop_event, tag: str, log_fn) -> None:
+    """轮询等待停止信号；页面/浏览器被关闭时记录原因并退出循环。"""
+    while not stop_event.is_set():
+        if page.is_closed():
+            log_fn(f'{tag} 浏览器页面已被关闭，结束连接')
+            return
+        await asyncio.sleep(0.5)
+    log_fn(f'{tag} 收到停止信号')
 
 # ─── Protobuf 解析工具 ───
 def read_varint(data, pos):
@@ -194,7 +261,9 @@ class IRCServer:
 
     def broadcast(self, event_type, user, text, extra=''):
         line = f'{event_type}|{user}|{text}|{extra}'
-        raw = f':{user.replace(" ", "_").replace("\r", "").replace("\n", "")}!live@BLRMod PRIVMSG {IRC_CHANNEL} :{line}\r\n'
+        # Python < 3.12 不允许 f-string 表达式中出现反斜杠，先在外部清洗昵称
+        safe_nick = user.replace(" ", "_").replace("\r", "").replace("\n", "")
+        raw = f':{safe_nick}!live@BLRMod PRIVMSG {IRC_CHANNEL} :{line}\r\n'
         data = raw.encode('utf-8')
         dead = []
         with self.lock:
@@ -230,6 +299,7 @@ def handle_douyin_msg(data, irc, log_fn):
             nick = pS(uf, 1) or '?'
             text = pS(mf, 1)
             irc.broadcast('CHAT', nick, text)
+            log_fn(f'[抖音] {nick}: {text}')
     elif method == 'WebcastGiftMessage':
         pay = pB(f, 5)
         if pay:
@@ -240,6 +310,7 @@ def handle_douyin_msg(data, irc, log_fn):
             gift = pS(gf, 1) or 'gift'
             cnt = pI(mf, 3) or 1
             irc.broadcast('GIFT', nick, gift, str(cnt))
+            log_fn(f'[抖音] [礼物] {nick} 送出 {gift} x{cnt}')
     elif method == 'WebcastLikeMessage':
         pay = pB(f, 5)
         if pay:
@@ -254,6 +325,7 @@ def handle_douyin_msg(data, irc, log_fn):
             uf = proto_fields(pB(mf, 3))
             nick = pS(uf, 1) or '?'
             irc.broadcast('JOIN', nick, '')
+            log_fn(f'[抖音] [进入] {nick} 进入直播间')
 
 async def run_douyin(room_id, irc, log_fn, stop_event):
     from playwright.async_api import async_playwright
@@ -269,6 +341,7 @@ async def run_douyin(room_id, irc, log_fn, stop_event):
             locale='zh-CN',
         )
         page = await ctx.new_page()
+        attach_diagnostics(browser, page, '[抖音]', log_fn)
 
         async def on_ws(ws):
             url = ws.url
@@ -286,10 +359,12 @@ async def run_douyin(room_id, irc, log_fn, stop_event):
         await page.goto(f'https://live.douyin.com/{room_id}', wait_until='domcontentloaded')
         await page.wait_for_timeout(3000)
         log_fn('[抖音] 页面已加载 ✓')
-        while not stop_event.is_set():
-            await page.wait_for_timeout(500)
-        await ctx.close()
-        await browser.close()
+        await wait_until_stopped(page, stop_event, '[抖音]', log_fn)
+        try:
+            await ctx.close()
+            await browser.close()
+        except Exception as e:
+            logger.debug('关闭浏览器时异常（可忽略）: %r', e)
 
 # ─── 小红书弹幕处理 ───
 def handle_xhs_msg(cd, irc, log_fn):
@@ -300,6 +375,7 @@ def handle_xhs_msg(cd, irc, log_fn):
         content = cd.get('content', {})
         text = content.get('message', content.get('desc', ''))
         irc.broadcast('CHAT', nick, text)
+        log_fn(f'[小红书] {nick}: {text}')
     elif msg_type == 'gift_comment':
         user = cd.get('send_user_info', {})
         nick = user.get('nick_name', '?')
@@ -307,12 +383,14 @@ def handle_xhs_msg(cd, irc, log_fn):
         name = gift.get('name', 'gift')
         cnt = gift.get('count', 1)
         irc.broadcast('GIFT', nick, name, str(cnt))
+        log_fn(f'[小红书] [礼物] {nick} 送出 {name} x{cnt}')
     elif msg_type == 'gift_dock_and_effect':
         pass
     elif msg_type == 'audience_join_v2':
         profile = cd.get('profile', {})
         nick = profile.get('nickname', '?')
         irc.broadcast('JOIN', nick, '')
+        log_fn(f'[小红书] [进入] {nick} 进入直播间')
     elif msg_type == 'praise':
         profile = cd.get('profile', {})
         nick = profile.get('nickname', '?')
@@ -335,6 +413,7 @@ async def run_xhs(room_id, irc, log_fn, stop_event):
             viewport={'width': 1280, 'height': 720},
         )
         page = await ctx.new_page()
+        attach_diagnostics(browser, page, '[小红书]', log_fn)
 
         async def on_ws(ws):
             url = ws.url
@@ -365,10 +444,12 @@ async def run_xhs(room_id, irc, log_fn, stop_event):
         await page.goto(f'https://www.xiaohongshu.com/livestream/{room_id}', wait_until='domcontentloaded')
         await page.wait_for_timeout(3000)
         log_fn('[小红书] 页面已加载 ✓')
-        while not stop_event.is_set():
-            await page.wait_for_timeout(500)
-        await ctx.close()
-        await browser.close()
+        await wait_until_stopped(page, stop_event, '[小红书]', log_fn)
+        try:
+            await ctx.close()
+            await browser.close()
+        except Exception as e:
+            logger.debug('关闭浏览器时异常（可忽略）: %r', e)
 
 # ─── B站弹幕处理 ───
 BILI_WS = 'wss://broadcastlv.chat.bilibili.com/sub'
@@ -402,20 +483,57 @@ def bili_get_room_info(room_id):
     port = data['data']['host_list'][0]['wss_port']
     return f'wss://{host}:{port}/sub', token
 
+try:
+    import brotli as _brotli
+except ImportError:
+    _brotli = None
+_bili_brotli_warned = False
+
+def bili_process_packets(raw: bytes, irc, log_fn) -> None:
+    """解析一帧 B站 弹幕数据（可能包含多个包，压缩包内部还嵌套多个包）。
+
+    参数:
+        raw: WebSocket 二进制帧
+        irc: IRC 广播服务
+        log_fn: 界面日志函数
+    说明:
+        ver=0/1 为明文 JSON，ver=2 为 zlib，ver=3 为 brotli（网页端默认）。
+    """
+    global _bili_brotli_warned
+    for ver, op, body in bili_unpack(raw):
+        if op != 5:
+            continue
+        if ver == 2:
+            bili_process_packets(zlib.decompress(body), irc, log_fn)
+        elif ver == 3:
+            if _brotli is None:
+                if not _bili_brotli_warned:
+                    _bili_brotli_warned = True
+                    log_fn('[B站] ⚠ 缺少 brotli 库，无法解压弹幕，请执行: pip install brotli')
+                continue
+            bili_process_packets(_brotli.decompress(body), irc, log_fn)
+        else:
+            try:
+                handle_bili_cmd(body, irc, log_fn)
+            except Exception as e:
+                logger.debug('[B站] 解析消息失败: %r body=%r', e, body[:200])
+
 def handle_bili_cmd(body, irc, log_fn):
     c = json.loads(body)
     cmd = c.get('cmd', '')
-    if cmd == 'DANMU_MSG':
+    if cmd.startswith('DANMU_MSG'):
         info = c.get('info', [])
         text = info[1] if len(info) > 1 else '?'
         nick = info[2][1] if len(info) > 2 and len(info[2]) > 1 else '?'
         irc.broadcast('CHAT', nick, text)
+        log_fn(f'[B站] {nick}: {text}')
     elif cmd == 'SEND_GIFT':
         d = c.get('data', {})
         nick = d.get('uname', '?')
         gift = d.get('giftName', 'gift')
         cnt = d.get('num', 1)
         irc.broadcast('GIFT', nick, gift, str(cnt))
+        log_fn(f'[B站] [礼物] {nick} 送出 {gift} x{cnt}')
     elif cmd == 'SUPER_CHAT_MESSAGE':
         d = c.get('data', {})
         info = d.get('user_info', {})
@@ -423,11 +541,22 @@ def handle_bili_cmd(body, irc, log_fn):
         text = d.get('message', '')
         price = d.get('price', 0)
         irc.broadcast('SC', nick, f'[{price}元] {text}')
+        log_fn(f'[B站] [SC {price}元] {nick}: {text}')
     elif cmd == 'INTERACT_WORD':
         d = c.get('data', {})
         if d.get('msg_type') == 1:
             nick = d.get('uname', '?')
             irc.broadcast('JOIN', nick, '')
+            log_fn(f'[B站] [进入] {nick} 进入直播间')
+    elif cmd == 'INTERACT_WORD_V2':
+        # 新版进场消息：data.pb 为 base64 编码的 protobuf，字段 2=昵称，字段 5=msg_type（1=进场）
+        pb = c.get('data', {}).get('pb')
+        if pb:
+            f = proto_fields(base64.b64decode(pb))
+            if pI(f, 5) == 1:
+                nick = pS(f, 2) or '?'
+                irc.broadcast('JOIN', nick, '')
+                log_fn(f'[B站] [进入] {nick} 进入直播间')
     elif cmd == 'GUARD_BUY':
         d = c.get('data', {})
         nick = d.get('username', '?')
@@ -446,33 +575,18 @@ async def run_bilibili(room_id, irc, log_fn, stop_event):
             viewport={'width': 1280, 'height': 720},
         )
         page = await ctx.new_page()
+        attach_diagnostics(browser, page, '[B站]', log_fn)
 
         async def on_ws(ws):
             url = ws.url
-            if 'broadcastlv.chat.bilibili' not in url:
+            logger.debug('[B站] 发现 WebSocket: %s', url)
+            # 弹幕服务器域名形如 zj-cn-live-comet.chat.bilibili.com / broadcastlv.chat.bilibili.com
+            if 'chat.bilibili.com' not in url or '/sub' not in url:
                 return
             log_fn('[B站] ✓ WebSocket 已连接 — 正在接收弹幕')
-            async def on_frame(payload):
-                raw = payload if isinstance(payload, bytes) else payload.encode('utf-8') if isinstance(payload, str) else b''
-                if not raw:
-                    return
-                for ver, op, body in bili_unpack(raw):
-                    if op == 5:
-                        if ver == 0:
-                            pass
-                        elif ver == 2:
-                            try:
-                                body = zlib.decompress(body)
-                            except:
-                                try:
-                                    import brotlicffi
-                                    body = brotlicffi.decompress(body)
-                                except:
-                                    continue
-                        try:
-                            handle_bili_cmd(body, irc, log_fn)
-                        except Exception as e:
-                            pass
+            def on_frame(payload):
+                raw = payload if isinstance(payload, bytes) else payload.encode('utf-8')
+                bili_process_packets(raw, irc, log_fn)
             ws.on('framereceived', on_frame)
             ws.on('close', lambda: log_fn('[B站] WebSocket 已断开'))
 
@@ -480,12 +594,49 @@ async def run_bilibili(room_id, irc, log_fn, stop_event):
         await page.goto(f'https://live.bilibili.com/{room_id}', wait_until='domcontentloaded')
         await page.wait_for_timeout(3000)
         log_fn('[B站] 页面已加载 ✓')
-        while not stop_event.is_set():
-            await page.wait_for_timeout(500)
-        await ctx.close()
-        await browser.close()
+        await wait_until_stopped(page, stop_event, '[B站]', log_fn)
+        try:
+            await ctx.close()
+            await browser.close()
+        except Exception as e:
+            logger.debug('关闭浏览器时异常（可忽略）: %r', e)
 
 # ─── 快手弹幕处理 (新增) ───
+# 快手网页端不推送进场消息；用在线观众列表(payloadType=340)的新增用户近似表示"进入直播间"
+# None 表示尚未收到首个列表（首个列表只作基线，不输出）
+_ks_seen_viewers: set[str] | None = None
+
+def handle_kuaishou_watching(data, irc, log_fn):
+    """解析 SCWebLiveWatchingUsers，把相比上次新出现的观众当作进入直播间。
+
+    参数:
+        data: 解压后的 payload（field 1 = repeated WebWatchingUserInfo，其 field 1 = SimpleUserInfo）
+        irc: IRC 广播服务
+        log_fn: 界面日志函数
+    说明:
+        该列表只包含部分在线观众（通常按贡献排序），因此是近似结果，会漏人。
+    """
+    global _ks_seen_viewers
+    names = []
+    for user_bytes in pL(proto_fields(data), 1):
+        if not isinstance(user_bytes, bytes):
+            continue
+        try:
+            uf = proto_fields(pB(proto_fields(user_bytes), 1))
+            name = pS(uf, 2)
+        except Exception:
+            continue
+        if name:
+            names.append(name)
+    if _ks_seen_viewers is None:
+        _ks_seen_viewers = set(names)
+        return
+    for name in names:
+        if name not in _ks_seen_viewers:
+            _ks_seen_viewers.add(name)
+            irc.broadcast('JOIN', name, '')
+            log_fn(f'[快手] [进入] {name} 进入直播间')
+
 def process_kuaishou_frame(raw, irc, log_fn):
     """解析快手 SocketMessage protobuf"""
     try:
@@ -506,6 +657,8 @@ def process_kuaishou_frame(raw, irc, log_fn):
 
         if payload_type == 310:  # SC_FEED_PUSH — 弹幕/礼物/点赞聚合推送
             handle_kuaishou_feed(payload, irc, log_fn)
+        elif payload_type == 340:  # SC_LIVE_WATCHING_LIST — 在线观众列表
+            handle_kuaishou_watching(payload, irc, log_fn)
         elif payload_type == 300:  # SC_ENTER_ROOM_ACK
             log_fn('[快手] ✓ 已进入直播间')
         elif payload_type == 1:  # heartbeat ack
@@ -535,6 +688,7 @@ def handle_kuaishou_feed(data, irc, log_fn):
                 nick = '?'
             if content:
                 irc.broadcast('CHAT', nick, content)
+                log_fn(f'[快手] {nick}: {content}')
         except:
             pass
 
@@ -556,6 +710,7 @@ def handle_kuaishou_feed(data, irc, log_fn):
             count = max(batch_size, combo_count, 1)
             gift_name = f'gift_{gift_id}'
             irc.broadcast('GIFT', nick, gift_name, str(count))
+            log_fn(f'[快手] [礼物] {nick} 送出 {gift_name} x{count}')
         except:
             pass
 
@@ -594,6 +749,8 @@ def handle_kuaishou_feed(data, irc, log_fn):
 async def run_kuaishou(room_id, irc, log_fn, stop_event):
     """快手直播弹幕读取 — 通过 Playwright 拦截 WebSocket"""
     from playwright.async_api import async_playwright
+    global _ks_seen_viewers
+    _ks_seen_viewers = None  # 每次连接重新建立观众基线
     log_fn(f'[快手] 正在连接房间 {room_id}...')
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=False, executable_path=CHROMIUM_EXE, args=[
@@ -607,6 +764,7 @@ async def run_kuaishou(room_id, irc, log_fn, stop_event):
             locale='zh-CN',
         )
         page = await ctx.new_page()
+        attach_diagnostics(browser, page, '[快手]', log_fn)
 
         async def on_ws(ws):
             url = ws.url
@@ -661,10 +819,12 @@ async def run_kuaishou(room_id, irc, log_fn, stop_event):
         log_fn(f'[快手] [调试] 页面标题: {title}')
 
         log_fn('[快手] 页面已加载 ✓')
-        while not stop_event.is_set():
-            await page.wait_for_timeout(500)
-        await ctx.close()
-        await browser.close()
+        await wait_until_stopped(page, stop_event, '[快手]', log_fn)
+        try:
+            await ctx.close()
+            await browser.close()
+        except Exception as e:
+            logger.debug('关闭浏览器时异常（可忽略）: %r', e)
 
 # ─── 微信视频号弹幕处理 (新增) ───
 def process_wechat_frame(raw, irc, log_fn):
@@ -802,6 +962,11 @@ def _try_extract_wechat_dict(data, irc, log_fn):
                     break
 
     if not content and not gift:
+        # 进入房间：通常只有昵称、没有内容/礼物
+        if nick and any(k in data for k in ['enter', 'join', 'member', 'come']):
+            irc.broadcast('JOIN', nick, '')
+            log_fn(f'[视频号] [进入] {nick} 进入直播间')
+            return True
         return False
 
     if not nick:
@@ -812,21 +977,18 @@ def _try_extract_wechat_dict(data, irc, log_fn):
         count = data.get('count', data.get('num', data.get('number', data.get('comboCount', 1))))
         gift_name = str(gift) if gift else 'gift'
         irc.broadcast('GIFT', nick, gift_name, str(count))
+        log_fn(f'[视频号] [礼物] {nick} 送出 {gift_name} x{count}')
         return True
 
     # 弹幕
     if content and isinstance(content, str):
         irc.broadcast('CHAT', nick, content)
+        log_fn(f'[视频号] {nick}: {content}')
         return True
 
     # 点赞
     if any(k in data for k in ['like', 'praise', 'heart']):
         irc.broadcast('LIKE', nick, '')
-        return True
-
-    # 进入房间
-    if any(k in data for k in ['enter', 'join', 'member', 'come']):
-        irc.broadcast('JOIN', nick, '')
         return True
 
     return False
@@ -890,6 +1052,7 @@ async def run_wechat_channels(room_id, irc, log_fn, stop_event):
             locale='zh-CN',
         )
         page = await ctx.new_page()
+        attach_diagnostics(browser, page, '[视频号]', log_fn)
 
         ws_connected = False
         frame_count = 0
@@ -1015,12 +1178,14 @@ async def run_wechat_channels(room_id, irc, log_fn, stop_event):
             log_fn(f'[视频号] ✓ 已连接到视频号后台，开始监听弹幕')
 
         # 持续等待接收弹幕
-        while not stop_event.is_set():
-            await page.wait_for_timeout(500)
+        await wait_until_stopped(page, stop_event, '[视频号]', log_fn)
 
         log_fn('[视频号] 正在关闭...')
-        await ctx.close()
-        await browser.close()
+        try:
+            await ctx.close()
+            await browser.close()
+        except Exception as e:
+            logger.debug('关闭浏览器时异常（可忽略）: %r', e)
 
 
 # ─── GUI 应用 ───
@@ -1040,6 +1205,7 @@ class App:
 
         self._build_ui()
         self.irc.start()
+        self.log(f'日志文件: {LOG_FILE}')
         self.log('就绪。选择平台，输入房间号或链接，点击连接。')
         self.log(f'游戏内输入 BLRMod 连接 | IRC: localhost:{IRC_PORT} 频道 {IRC_CHANNEL}')
 
@@ -1121,6 +1287,11 @@ class App:
         self.log_box.tag_config('sys', foreground='#888888')
 
     def log(self, msg):
+        # 调试信息只写入日志文件，不显示在界面上
+        if '[调试]' in msg:
+            logger.debug(msg)
+            return
+        logger.info(msg)
         def _do():
             self.log_box.configure(state='normal')
             ts = datetime.now().strftime('%H:%M:%S')
@@ -1191,9 +1362,17 @@ class App:
                 else:
                     await run_douyin(room_id, self.irc, self.log, self.stop_ev)
             except Exception as e:
-                self.log(f'[错误] {e}')
+                # str(e) 可能为空，界面显示类型名，完整堆栈写入日志文件
+                self.log(f'[错误] {type(e).__name__}: {e}')
+                logger.exception('连接任务异常 platform=%s room=%s', platform, room_id)
             finally:
+                logger.info('连接任务结束 platform=%s room=%s', platform, room_id)
                 self.root.after(0, self._on_stopped)
+
+        logger.info('开始连接 platform=%s room=%s exe=%s', platform, room_id, CHROMIUM_EXE)
+        # 每次连接都新建停止事件：旧事件在上次断开后仍为 set 状态，
+        # 复用会导致浏览器刚打开、页面加载完就立即退出
+        self.stop_ev = asyncio.Event()
 
         def _thread():
             self.loop = asyncio.new_event_loop()
